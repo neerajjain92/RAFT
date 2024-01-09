@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"log"
 	"testing"
 	"time"
 )
@@ -61,7 +62,7 @@ func NewHarness(t *testing.T, totalServers int) *Harness {
 // to stop running
 func (harness *Harness) Shutdown() {
 	for i := 0; i < harness.totalServers; i++ {
-		harness.cluster[i].DisconnetAll()
+		harness.cluster[i].DisconnectAll()
 	}
 	for i := 0; i < harness.totalServers; i++ {
 		harness.cluster[i].Shutdown()
@@ -77,13 +78,15 @@ func (harness *Harness) CheckSingleLeader() (int, int) {
 		leaderTerm := -1
 
 		for i := 0; i < harness.totalServers; i++ {
-			_, term, isLeader := harness.cluster[i].cm.Report()
-			if isLeader {
-				if leaderId < 0 {
-					leaderId = i
-					leaderTerm = term
-				} else {
-					harness.t.Fatalf("both %d and %d think they are leaders", leaderId, i)
+			if harness.connected[i] {
+				_, term, isLeader := harness.cluster[i].cm.Report()
+				if isLeader {
+					if leaderId < 0 {
+						leaderId = i
+						leaderTerm = term
+					} else {
+						harness.t.Fatalf("both %d and %d think they are leaders", leaderId, i)
+					}
 				}
 			}
 		}
@@ -96,4 +99,52 @@ func (harness *Harness) CheckSingleLeader() (int, int) {
 
 	harness.t.Fatalf("leader not found")
 	return -1, -1
+}
+
+// DisconnectPeer disconnects a server from all other servers in the cluster
+func (harness *Harness) DisconnectPeer(id int) {
+	tlog("Disconnecting %d", id)
+	harness.cluster[id].DisconnectAll()
+	for j := 0; j < harness.totalServers; j++ {
+		if j != id {
+			harness.cluster[j].DisconnectPeer(id)
+		}
+	}
+	harness.connected[id] = false
+}
+
+func (harness *Harness) Reconnectpeer(id int) {
+	tlog("Reconnecting %d", id)
+	for i := 0; i < harness.totalServers; i++ {
+		if i != id {
+			if err := harness.cluster[id].ConnectToPeer(i, harness.cluster[i].GetListenerAddr()); err != nil {
+				harness.t.Fatal(err)
+			}
+			if err := harness.cluster[i].ConnectToPeer(id, harness.cluster[id].GetListenerAddr()); err != nil {
+				harness.t.Fatal(err)
+			}
+		}
+	}
+	harness.connected[id] = true
+}
+
+func tlog(format string, a ...interface{}) {
+	format = "[TEST] " + format
+	log.Printf(format, a...)
+}
+
+func SleepMs(n int) {
+	time.Sleep(time.Duration(n) * time.Millisecond)
+}
+
+// CheckNoLeader checks that no connected server considers itself as the leader
+func (harness *Harness) CheckNoLeader() {
+	for i := 0; i < harness.totalServers; i++ {
+		if harness.connected[i] {
+			_, _, isLeader := harness.cluster[i].cm.Report()
+			if isLeader {
+				harness.t.Fatalf("Server %d is a leader, Want None", i)
+			}
+		}
+	}
 }

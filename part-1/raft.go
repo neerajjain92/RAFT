@@ -215,7 +215,7 @@ func (cm *ConsensusModule) startElection() {
 				cm.debugLog("Received RequestVoteReply %+v", reply)
 
 				if cm.state != Candidate {
-					cm.debugLog("Someone else became leader, hence dropping the reply +%v state=%v", args, cm.state)
+					cm.debugLog("Someone else became leader or Leader got the reply, hence dropping the reply %+v state=%v", args, cm.state)
 					return
 				}
 
@@ -311,7 +311,7 @@ func (cm *ConsensusModule) leaderSendHeartBeats() {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
-					cm.debugLog("Term out of date in heartbeat reply savedCurrentTerm=%d, replyTerm=%d", savedCurrentTerm, reply.Term)
+					cm.debugLog("Looks like, I am no longer a leader, someone else became leader; savedCurrentTerm=%d, replyTerm=%d", savedCurrentTerm, reply.Term)
 					cm.becomeFollower(reply.Term)
 				}
 			}
@@ -394,8 +394,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	cm.debugLog("Received AppendEntries request: %+v [cmId=%d, currentTerm=%d, votedFor=%d]", args, cm.id, cm.currentTerm, cm.votedFor)
 
 	if args.Term > cm.currentTerm {
-		cm.debugLog("... term out of date in AppendEntries")
+		cm.debugLog("...Term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
+	} else if args.Term < cm.currentTerm {
+		cm.debugLog("Previous leader might be sending older AppendEntries, lets inform him he is no longer a leader; %+v :[cmId=%d, currentTerm=%d, votedFor=%d]", args, cm.id, cm.currentTerm, cm.votedFor)
 	}
 
 	reply.Success = false

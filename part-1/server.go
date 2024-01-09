@@ -93,6 +93,7 @@ func (server *Server) Call(id int, serviceMethod string, args interface{}, reply
 	server.mu.Unlock()
 
 	if peer == nil {
+		log.Printf("Call Client %d after it's closed", id)
 		return fmt.Errorf("Call Client %d after it's closed", id)
 	} else {
 		return peer.Call(serviceMethod, args, reply)
@@ -144,13 +145,14 @@ func (rpc *RPCProxy) SayHello() {
 // Utility Method
 
 // DisconnectAll closes all the connections to peers of this server
-func (server *Server) DisconnetAll() {
+func (server *Server) DisconnectAll() {
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	for id := range server.peerClients {
 		if server.peerClients[id] != nil {
 			server.peerClients[id].Close() // Close the RPC client
 			server.peerClients[id] = nil
+			log.Printf("Closing the Peer [%d] of server[%d] ", id, server.serverId)
 		}
 	}
 }
