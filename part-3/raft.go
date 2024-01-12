@@ -3,6 +3,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -102,6 +104,9 @@ type ConsensusModule struct {
 	// it's used to issue RPC calls to the peers
 	server *Server
 
+	// storage is used to persist state
+	storage Storage
+
 	// commitChan is the channel where the CM is going to report committed log
 	// entries. It's passed in by the client during construction
 	// And by client here we don't mean end-user, its the application (such as database, key-value store)
@@ -113,6 +118,10 @@ type ConsensusModule struct {
 	// that commit new entries to the log to notify that these entries may be sent
 	// on the commitChan
 	newCommitReadyChan chan struct{}
+
+	// triggerAppendEntryChan is an internal notification channel used to trigger
+	// sending new AppendEnties to followers when interesting changes occurred.
+	triggerAppendEntryChan chan struct{}
 
 	// Persistent Raft state of all servers
 	// Non-Volatile stuff
@@ -134,13 +143,15 @@ type ConsensusModule struct {
 // NewConsensusModule creates a new CM
 // ReadyChannel signals the CM that all peers arw connected and
 // it's safe to start it's state machine
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
+	cm.triggerAppendEntryChan = make(chan struct{}, 1)
 
 	// Initially every node in the cluster is a follower
 	cm.state = Follower
@@ -151,6 +162,10 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+
+	if cm.storage.HasData() {
+		cm.restoreFromStorage()
+	}
 
 	cm.debugLog("Inside NewConsensusModule id=%d, peerIds=%v", id, peerIds)
 
@@ -169,6 +184,60 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 	// cm.commitChan
 	go cm.commitChanSender()
 	return cm
+}
+
+// restoreFromStorage restores the persistent state of this CM from storage
+// It should be called during construction of ConsensusModule before any concurrency begins
+func (cm *ConsensusModule) restoreFromStorage() {
+	// We will be reading only Non-Volatile items from storage which survived server crashes
+	if currentTerm, found := cm.storage.Get("currentTerm"); found {
+		decoder := gob.NewDecoder(bytes.NewBuffer(currentTerm))
+		if err := decoder.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("CurrentTerm not found in storage")
+	}
+
+	if votedFor, found := cm.storage.Get("votedFor"); found {
+		decoder := gob.NewDecoder(bytes.NewBuffer(votedFor))
+		if err := decoder.Decode(&cm.votedFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+
+	if logData, found := cm.storage.Get("log"); found {
+		decoder := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := decoder.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+// persistToStorage saves all non-volatile dataa of a CM into storage
+func (cm *ConsensusModule) persistToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedForData bytes.Buffer
+	if err := gob.NewEncoder(&votedForData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedForData.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
+
 }
 
 // commitChanSender is responsible for sending committed entries on cm.commitChan
@@ -209,14 +278,17 @@ func (cm *ConsensusModule) commitChanSender() {
 // if false is returned, the client will have to find a different CM to submit this command to
 func (cm *ConsensusModule) Submit(command interface{}) bool {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
 	cm.debugLog("Submit received by %v: %v", cm.state, command)
 	if cm.state == Leader {
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.persistToStorage() // let's persist into permanent storage to survive crashes
 		cm.debugLog("cm=%+v;Command appended to Log by leader, log=%v", cm, cm.log)
+		cm.mu.Unlock()
+
+		cm.triggerAppendEntryChan <- struct{}{}
 		return true
 	}
+	cm.mu.Unlock()
 	return false
 }
 
@@ -371,29 +443,55 @@ func (cm *ConsensusModule) startLeader() {
 	}
 	cm.debugLog("Becomes Leader; term=%d, log=%v, nextIndex=%v, matchIndex=%v", cm.currentTerm, cm.log, cm.nextIndex, cm.matchIndex)
 
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
+	// This goRoutine runs in the background and sends AppendEntries to peers on either:
+	// * Whenever something is sent on triggerAEChan
+	// * ... Or every  50ms, if no event occurs on triggerAEChan
+	go func(heartBeatTimeout time.Duration) {
+		// Immediately send AppendEntries to peers
+		cm.leaderSendAppendEntries()
 
-		// Send periodic heartbeats, as long as still a leader
+		timer := time.NewTimer(heartBeatTimeout)
+		defer timer.Stop()
+
 		for {
-			cm.leaderSendHeartBeats()
-			<-ticker.C
+			doSend := false
+			select {
+			case <-timer.C: // Either heartBeatTimed out which is 50 milliseconds
+				doSend = true
 
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
+				// Reset the timer to fire again after heartBeatTimeout
+				timer.Stop()
+				timer.Reset(heartBeatTimeout)
+			case _, ok := <-cm.triggerAppendEntryChan: // or we receive an entry on triggerAppendEntryChan
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+				// Reset timer for heartbeatTimeout.
+				if !timer.Stop() {
+					<-timer.C
+				}
+				timer.Reset(heartBeatTimeout)
 			}
-			cm.mu.Unlock()
-		}
-	}()
 
+			if doSend {
+				cm.mu.Lock()
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAppendEntries()
+			}
+		}
+
+	}(50 * time.Millisecond)
 }
 
-// leaderSendHeartBeats sends a round of heartbeats to all peers,
+// leaderSendAppendEntries sends a round of heartbeats to all peers,
 // collects their replies and adjusts CM's state
-func (cm *ConsensusModule) leaderSendHeartBeats() {
+func (cm *ConsensusModule) leaderSendAppendEntries() {
 	cm.mu.Lock()
 	if cm.state != Leader {
 		cm.mu.Unlock()
@@ -446,7 +544,6 @@ func (cm *ConsensusModule) leaderSendHeartBeats() {
 						// Till where follower has stored the logs
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
 
-						cm.debugLog("AppendEntries Reply from %d success: nextIndex := %v, matchIndex=%v", peerId, cm.nextIndex, cm.matchIndex)
 						savedCommitIndex := cm.commitIndex
 
 						// Now walk from commitIndex's next index and check till which index you have the most follower
@@ -464,9 +561,11 @@ func (cm *ConsensusModule) leaderSendHeartBeats() {
 								}
 							}
 						}
+						cm.debugLog("AppendEntries Reply from %d success: nextIndex := %v, matchIndex=%v", peerId, cm.nextIndex, cm.matchIndex)
 						if cm.commitIndex > savedCommitIndex {
 							cm.debugLog("Leader is setting commitIndex := %d", cm.commitIndex)
 							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAppendEntryChan <- struct{}{}
 						}
 					} else {
 						// Looks like follower doesn't have right logs, let's try with previous index

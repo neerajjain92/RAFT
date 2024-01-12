@@ -3,4 +3,5 @@ go 1.21.5
 use (
 	./part-1
 	./part-2
+	./part-3
 )
